@@ -1,17 +1,17 @@
 'use client';
 
 /**
- * WhatsApp Bulk Sender — single-page app
+ * WhatsApp Bulk Sender — single-page app, multi-sheet Excel support
  *
  * Flow:
  *  1. User uploads an Excel file (.xlsx / .xls)
- *  2. SheetJS parses it once → rows stored in state
- *  3. Phone-number column is auto-detected (user can override)
- *  4. Numbers are normalised to E.164 digits via useMemo (runs only when
- *     rows / column / country-code change — safe for 10 000 rows)
- *  5. User steps through numbers with NEXT / SAME / GO TO ROW
- *  6. Each action opens  https://wa.me/<number>?text=<encoded_message>
- *  7. Progress + settings persisted in localStorage
+ *  2. SheetJS parses ALL sheets at once — each sheet gets its own row array
+ *  3. Phone-number column is auto-detected independently per sheet
+ *  4. User can override the column per sheet and toggle sheets on/off
+ *  5. All enabled sheets are combined (in order) into one flat phone list
+ *  6. User steps through numbers with NEXT / SAME / GO TO ROW
+ *  7. Each action opens  https://wa.me/<number>?text=<encoded_message>
+ *  8. Progress + settings persisted in localStorage
  */
 
 import { useState, useRef, useCallback, useEffect, useMemo } from 'react';
@@ -21,13 +21,27 @@ import * as XLSX from 'xlsx';
 // Types
 // ─────────────────────────────────────────────────────────────────────────────
 
+/** Configuration + data for a single Excel sheet */
+interface SheetConfig {
+  name: string;
+  rows: Record<string, unknown>[];
+  headers: string[];
+  /** The column header selected as the phone-number source */
+  phoneCol: string;
+  /** Whether this sheet is included in the combined phone list */
+  enabled: boolean;
+}
+
+/** One valid, normalised phone number ready to send */
 interface PhoneEntry {
-  /** 1-based row number in the original sheet (for display) */
+  /** 1-based row number within that sheet */
   rowNum: number;
-  /** Raw cell value exactly as read from Excel */
+  /** Raw cell value as read from Excel */
   raw: string;
   /** E.164 digits without "+" — used in the wa.me URL */
   normalized: string;
+  /** Name of the sheet this entry came from */
+  sheetName: string;
 }
 
 type Notice = { text: string; kind: 'error' | 'success' | 'info' };
@@ -35,16 +49,16 @@ type Notice = { text: string; kind: 'error' | 'success' | 'info' };
 // ─────────────────────────────────────────────────────────────────────────────
 // Phone normalisation
 //
-// Accepted formats:
-//   9876543210        → 10-digit local → prepend default CC
-//   +919876543210     → already E.164  → strip "+"
-//   919876543210      → 12 digits, assume CC already present
-//   09876543210       → leading 0      → strip 0, prepend CC
-//   98765 43210       → spaces         → strip, then apply rules
-//   98765-43210       → dashes         → strip, then apply rules
-//   00919876543210    → IDD "00"       → strip "00"
+// Accepted input formats:
+//   9876543210       → 10-digit local  → prepend default CC
+//   +919876543210    → already E.164   → strip "+"
+//   919876543210     → 12 digits       → assume CC present
+//   09876543210      → leading "0"     → strip 0, prepend CC
+//   98765 43210      → spaces          → strip, then apply rules
+//   98765-43210      → dashes          → strip, then apply rules
+//   00919876543210   → IDD "00"        → strip "00"
 //
-// Returns null for anything too short / clearly not a number.
+// Returns null for anything too short / clearly not numeric.
 // ─────────────────────────────────────────────────────────────────────────────
 
 function normalizePhone(raw: unknown, countryCode: string): string | null {
@@ -53,31 +67,28 @@ function normalizePhone(raw: unknown, countryCode: string): string | null {
   const str = String(raw).trim();
   if (!str) return null;
 
-  // Detect a leading "+" before stripping non-digits
+  // Detect a leading "+" before we strip everything
   const hasPlus = str.startsWith('+');
 
-  // Strip every formatting character: spaces, dashes, dots, parens, commas
+  // Strip formatting: spaces, dashes, dots, parens, commas
   const digits = str.replace(/[\s\-().,]/g, '').replace(/\D/g, '');
 
-  // Reject anything implausibly short
-  if (!digits || digits.length < 7) return null;
+  if (!digits || digits.length < 7) return null; // too short
 
-  // Already country-coded with "+"  →  trust the digits as-is
-  if (hasPlus) return digits;
+  if (hasPlus) return digits;                     // already country-coded
 
-  // IDD prefix "00"  →  strip it, remainder is country-coded
+  // IDD "00" prefix → strip, rest is already country-coded
   if (digits.startsWith('00') && digits.length > 6) return digits.slice(2);
 
-  // Sanitise the default country code (accept "+91" or "91")
   const cc = countryCode.replace(/\D/g, '');
 
-  // Leading "0" STD prefix (common in many countries)  →  replace with CC
+  // Leading "0" STD prefix → replace with CC
   if (digits.startsWith('0') && digits.length <= 11) return cc + digits.slice(1);
 
-  // Classic 10-digit local number  →  prepend CC
+  // Classic 10-digit local number → prepend CC
   if (digits.length === 10) return cc + digits;
 
-  // Anything else: assume the number already carries a country code
+  // Anything else → assume it already carries a country code
   return digits;
 }
 
@@ -85,15 +96,15 @@ function normalizePhone(raw: unknown, countryCode: string): string | null {
 // Auto-detect the column most likely to hold phone numbers.
 //
 // Scoring:
-//   +15  if the header name contains a phone-related keyword
-//   +1   for every cell (up to 30 sampled) whose digits are 7–15 chars long
+//   +15  header contains a phone-related keyword
+//   +1   per sampled cell whose stripped digits are 7–15 chars
 // ─────────────────────────────────────────────────────────────────────────────
 
 function detectPhoneColumn(data: Record<string, unknown>[]): string | null {
   if (!data.length) return null;
 
   const headers = Object.keys(data[0]);
-  const sample = data.slice(0, Math.min(30, data.length));
+  const sample  = data.slice(0, Math.min(30, data.length));
 
   let bestCol: string | null = null;
   let bestScore = 0;
@@ -109,17 +120,14 @@ function detectPhoneColumn(data: Record<string, unknown>[]): string | null {
       if (/^\d{7,15}$/.test(val)) score += 1;
     }
 
-    if (score > bestScore) {
-      bestScore = score;
-      bestCol = header;
-    }
+    if (score > bestScore) { bestScore = score; bestCol = header; }
   }
 
   return bestCol;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// localStorage key constants
+// localStorage keys
 // ─────────────────────────────────────────────────────────────────────────────
 
 const LS = {
@@ -130,10 +138,10 @@ const LS = {
 } as const;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Helper: clamp a number between min and max
+// Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-const clamp = (n: number, min: number, max: number) => Math.min(Math.max(n, min), max);
+const clamp = (n: number, lo: number, hi: number) => Math.min(Math.max(n, lo), hi);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Component
@@ -141,27 +149,25 @@ const clamp = (n: number, min: number, max: number) => Math.min(Math.max(n, min)
 
 export default function Home() {
 
-  // ── Raw sheet data (replaced only on new file upload) ──────────────────────
-  const [headers,    setHeaders]    = useState<string[]>([]);
-  const [rows,       setRows]       = useState<Record<string, unknown>[]>([]);
-  const [phoneCol,   setPhoneCol]   = useState<string>('');
-  const [fileId,     setFileId]     = useState<string>('');
+  // ── Per-sheet data (parsed once, mutated only on column/toggle changes) ─────
+  const [sheets,       setSheets]       = useState<SheetConfig[]>([]);
+  const [fileId,       setFileId]       = useState<string>('');
 
-  // ── User settings (persisted) ───────────────────────────────────────────────
-  const [countryCode, setCountryCode] = useState<string>('+91');
-  const [message,     setMessage]     = useState<string>('');
+  // ── User settings (persisted to localStorage) ──────────────────────────────
+  const [countryCode,  setCountryCode]  = useState<string>('+91');
+  const [message,      setMessage]      = useState<string>('');
 
-  // ── Navigation state ────────────────────────────────────────────────────────
+  // ── Navigation ──────────────────────────────────────────────────────────────
   const [currentIndex, setCurrentIndex] = useState<number>(0);
   const [goToInput,    setGoToInput]    = useState<string>('');
 
-  // ── UI feedback ─────────────────────────────────────────────────────────────
-  const [isLoading, setIsLoading] = useState<boolean>(false);
-  const [notice,    setNotice]    = useState<Notice | null>(null);
+  // ── UI ──────────────────────────────────────────────────────────────────────
+  const [isLoading,    setIsLoading]    = useState<boolean>(false);
+  const [notice,       setNotice]       = useState<Notice | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // ── Restore persisted settings on first render ─────────────────────────────
+  // ── Restore persisted settings on mount ─────────────────────────────────────
   useEffect(() => {
     const cc  = localStorage.getItem(LS.countryCode);
     const msg = localStorage.getItem(LS.message);
@@ -169,35 +175,39 @@ export default function Home() {
     if (msg) setMessage(msg);
   }, []);
 
-  // ── Persist settings whenever they change ──────────────────────────────────
   useEffect(() => { localStorage.setItem(LS.countryCode, countryCode); }, [countryCode]);
-  useEffect(() => { localStorage.setItem(LS.message,     message);     }, [message]);
-
-  // ── Persist current index whenever it changes (only while a file is loaded) ─
+  useEffect(() => { localStorage.setItem(LS.message, message);         }, [message]);
   useEffect(() => {
     if (fileId) localStorage.setItem(LS.index, String(currentIndex));
   }, [currentIndex, fileId]);
 
   // ─────────────────────────────────────────────────────────────────────────────
-  // Derive the list of valid PhoneEntry objects from raw rows.
+  // Combined phone list — built from all ENABLED sheets, in sheet order.
   //
-  // useMemo ensures this O(n) pass only reruns when its three inputs change —
-  // typing in the message textarea will NOT trigger it.
+  // useMemo: only reruns when sheets array or countryCode changes.
+  // Typing in the message box does NOT trigger this.
   // ─────────────────────────────────────────────────────────────────────────────
   const phoneNumbers = useMemo<PhoneEntry[]>(() => {
-    if (!phoneCol || !rows.length) return [];
-
     const result: PhoneEntry[] = [];
-    for (let i = 0; i < rows.length; i++) {
-      const raw        = String(rows[i][phoneCol] ?? '');
-      const normalized = normalizePhone(rows[i][phoneCol], countryCode);
-      if (normalized) result.push({ rowNum: i + 1, raw, normalized });
+
+    for (const sheet of sheets) {
+      // Skip disabled sheets or sheets with no column chosen
+      if (!sheet.enabled || !sheet.phoneCol || !sheet.rows.length) continue;
+
+      for (let i = 0; i < sheet.rows.length; i++) {
+        const raw        = String(sheet.rows[i][sheet.phoneCol] ?? '');
+        const normalized = normalizePhone(sheet.rows[i][sheet.phoneCol], countryCode);
+        if (normalized) {
+          result.push({ rowNum: i + 1, raw, normalized, sheetName: sheet.name });
+        }
+      }
     }
+
     return result;
-  }, [rows, phoneCol, countryCode]);
+  }, [sheets, countryCode]);
 
   // ─────────────────────────────────────────────────────────────────────────────
-  // File upload handler
+  // File upload — parses every sheet independently
   // ─────────────────────────────────────────────────────────────────────────────
   const handleFileUpload = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -206,41 +216,48 @@ export default function Home() {
     setIsLoading(true);
     setNotice(null);
 
-    // Simple file identity fingerprint: name + byte-size.
-    // Used to decide whether to restore saved progress or reset it.
+    // Fingerprint: name + byte-size (good enough to detect a different file)
     const newFileId = `${file.name}_${file.size}`;
 
     const reader = new FileReader();
-
     reader.onload = (evt) => {
       try {
         const workbook = XLSX.read(evt.target?.result, { type: 'binary' });
-        const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
 
-        // raw: false → SheetJS returns formatted text strings.
-        // This preserves leading zeros and "+" signs that Excel would otherwise
-        // drop when storing a phone number as a plain numeric cell.
-        const jsonData = XLSX.utils.sheet_to_json<Record<string, unknown>>(firstSheet, {
-          defval: '',
-          raw: false,
-        });
-
-        if (!jsonData.length) {
-          setNotice({ text: 'The file is empty or has no data rows.', kind: 'error' });
+        if (!workbook.SheetNames.length) {
+          setNotice({ text: 'The workbook contains no sheets.', kind: 'error' });
           setIsLoading(false);
           return;
         }
 
-        const hdrs        = Object.keys(jsonData[0]);
-        const detectedCol = detectPhoneColumn(jsonData) ?? hdrs[0] ?? '';
+        // Parse every sheet; auto-detect phone column for each independently
+        const parsed: SheetConfig[] = workbook.SheetNames.map(name => {
+          const ws = workbook.Sheets[name];
 
-        // Commit sheet data to state — this is the single source of truth
-        setHeaders(hdrs);
-        setRows(jsonData);
-        setPhoneCol(detectedCol);
+          // raw: false → formatted text strings, preserving leading 0s and "+" signs
+          const rows = XLSX.utils.sheet_to_json<Record<string, unknown>>(ws, {
+            defval: '',
+            raw: false,
+          });
+
+          const headers  = rows.length ? Object.keys(rows[0]) : [];
+          const phoneCol = detectPhoneColumn(rows) ?? headers[0] ?? '';
+
+          return { name, rows, headers, phoneCol, enabled: rows.length > 0 };
+        });
+
+        // If every sheet is empty disable all (user will see a clear error)
+        const totalRows = parsed.reduce((s, sh) => s + sh.rows.length, 0);
+        if (totalRows === 0) {
+          setNotice({ text: 'All sheets appear to be empty.', kind: 'error' });
+          setIsLoading(false);
+          return;
+        }
+
+        setSheets(parsed);
         setFileId(newFileId);
 
-        // Restore progress for the same file; otherwise start fresh
+        // Restore or reset progress
         const prevFileId = localStorage.getItem(LS.fileId);
         if (prevFileId === newFileId) {
           const saved = parseInt(localStorage.getItem(LS.index) ?? '0', 10);
@@ -251,24 +268,35 @@ export default function Home() {
           setCurrentIndex(0);
         }
 
+        // Build a summary notice, e.g. "3 sheets · Sheet1 (150), Sheet2 (89), Sheet3 (212)"
+        const summary = parsed
+          .map(s => `${s.name} (${s.rows.length.toLocaleString()})`)
+          .join(' · ');
         setNotice({
-          text: `Loaded ${jsonData.length.toLocaleString()} rows · auto-detected column: "${detectedCol}"`,
+          text: `${parsed.length} sheet${parsed.length > 1 ? 's' : ''} loaded — ${summary}`,
           kind: 'success',
         });
       } catch {
         setNotice({ text: 'Could not parse the file. Please upload a valid .xlsx or .xls.', kind: 'error' });
       } finally {
         setIsLoading(false);
-        // Reset the input so the same file can be re-uploaded if needed
         if (fileInputRef.current) fileInputRef.current.value = '';
       }
     };
-
     reader.readAsBinaryString(file);
   }, []);
 
   // ─────────────────────────────────────────────────────────────────────────────
-  // Open WhatsApp deep-link in a new tab
+  // Per-sheet update helper — patches one sheet by index, resets progress
+  // ─────────────────────────────────────────────────────────────────────────────
+  const updateSheet = useCallback((idx: number, patch: Partial<SheetConfig>) => {
+    setSheets(prev => prev.map((s, i) => i === idx ? { ...s, ...patch } : s));
+    setCurrentIndex(0); // any column/toggle change resets the pointer
+    setNotice(null);
+  }, []);
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // WhatsApp link
   // ─────────────────────────────────────────────────────────────────────────────
   const openWhatsApp = useCallback((normalized: string) => {
     const url = `https://wa.me/${normalized}?text=${encodeURIComponent(message)}`;
@@ -281,24 +309,24 @@ export default function Home() {
 
   const current = phoneNumbers[currentIndex] ?? null;
 
-  /** Open current number in WhatsApp, then advance the pointer */
+  /** Open WhatsApp for the current number, then advance the pointer */
   const handleNext = useCallback(() => {
     if (!current) return;
     openWhatsApp(current.normalized);
     setCurrentIndex(prev => clamp(prev + 1, 0, phoneNumbers.length - 1));
   }, [current, phoneNumbers.length, openWhatsApp]);
 
-  /** Re-open current number in WhatsApp WITHOUT advancing */
+  /** Re-open the same number WITHOUT moving the pointer */
   const handleSame = useCallback(() => {
     if (!current) return;
     openWhatsApp(current.normalized);
   }, [current, openWhatsApp]);
 
-  /** Jump directly to a user-specified 1-based row in the valid-number list */
+  /** Jump to a 1-based index in the combined phone list */
   const handleGoTo = useCallback(() => {
     const n = parseInt(goToInput, 10);
     if (isNaN(n) || n < 1 || n > phoneNumbers.length) {
-      setNotice({ text: `Please enter a number between 1 and ${phoneNumbers.length}.`, kind: 'error' });
+      setNotice({ text: `Enter a number between 1 and ${phoneNumbers.length}.`, kind: 'error' });
       return;
     }
     setCurrentIndex(n - 1);
@@ -307,34 +335,24 @@ export default function Home() {
   }, [goToInput, phoneNumbers.length]);
 
   // ─────────────────────────────────────────────────────────────────────────────
-  // Derived display values
+  // Derived values
   // ─────────────────────────────────────────────────────────────────────────────
 
   const total       = phoneNumbers.length;
   const processed   = currentIndex;
   const remaining   = Math.max(0, total - processed);
   const progressPct = total > 0 ? Math.round((processed / total) * 100) : 0;
-  const allDone     = rows.length > 0 && total > 0 && currentIndex >= total;
-
-  /** Raw values of the first 5 rows in the chosen column — for user confirmation */
-  const preview = useMemo(() => {
-    if (!phoneCol || !rows.length) return [];
-    return rows.slice(0, 5).map((row, i) => ({
-      rowNum: i + 1,
-      raw: String(row[phoneCol] ?? ''),
-    }));
-  }, [rows, phoneCol]);
-
-  const hasFile = rows.length > 0;
+  const hasFile     = sheets.length > 0;
+  const allDone     = hasFile && total > 0 && currentIndex >= total;
 
   // ─────────────────────────────────────────────────────────────────────────────
-  // Tailwind helper strings
+  // Tailwind shorthand strings
   // ─────────────────────────────────────────────────────────────────────────────
 
-  const card   = 'bg-white rounded-2xl shadow-sm border border-slate-100 p-5';
-  const label  = 'block text-sm font-medium text-slate-600 mb-1.5';
-  const input  = 'w-full border border-slate-200 rounded-xl px-3 py-3 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-green-400 transition';
+  const card         = 'bg-white rounded-2xl shadow-sm border border-slate-100 p-5';
+  const inputCls     = 'w-full border border-slate-200 rounded-xl px-3 py-3 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-green-400 transition';
   const sectionTitle = 'font-semibold text-xs uppercase tracking-widest text-slate-400 mb-4';
+  const labelCls     = 'block text-sm font-medium text-slate-600 mb-1.5';
 
   // ─────────────────────────────────────────────────────────────────────────────
   // Render
@@ -344,7 +362,7 @@ export default function Home() {
     <div className="min-h-screen bg-slate-50 text-slate-900">
       <div className="max-w-md mx-auto px-4 py-8 space-y-4">
 
-        {/* ── App header ───────────────────────────────────────────────────── */}
+        {/* ── Header ───────────────────────────────────────────────────────── */}
         <div className="text-center pb-1">
           <div className="inline-flex items-center justify-center w-12 h-12 rounded-2xl bg-green-500 mb-3 shadow">
             <svg viewBox="0 0 24 24" className="w-7 h-7 fill-white" xmlns="http://www.w3.org/2000/svg">
@@ -352,7 +370,7 @@ export default function Home() {
             </svg>
           </div>
           <h1 className="text-2xl font-bold text-slate-800 tracking-tight">WhatsApp Bulk Sender</h1>
-          <p className="text-sm text-slate-400 mt-1">Upload Excel · Normalise numbers · Send one by one</p>
+          <p className="text-sm text-slate-400 mt-1">Multi-sheet Excel · Normalise numbers · Send one by one</p>
         </div>
 
         {/* ── 1. Upload ─────────────────────────────────────────────────────── */}
@@ -378,27 +396,28 @@ export default function Home() {
             ].join(' ')}
           >
             {isLoading ? (
-              <span className="text-slate-500 text-sm font-medium">⏳ Parsing…</span>
+              <span className="text-slate-500 text-sm font-medium">⏳ Parsing all sheets…</span>
             ) : hasFile ? (
               <>
-                <span className="text-green-600 font-bold text-sm">✓ File loaded</span>
+                <span className="text-green-600 font-bold text-sm">
+                  ✓ {sheets.length} sheet{sheets.length > 1 ? 's' : ''} loaded
+                </span>
                 <span className="text-slate-400 text-xs mt-1">
-                  {rows.length.toLocaleString()} rows · tap to replace
+                  {sheets.reduce((s, sh) => s + sh.rows.length, 0).toLocaleString()} total rows · tap to replace
                 </span>
               </>
             ) : (
               <>
                 <span className="text-slate-600 font-semibold text-sm">Tap to upload .xlsx or .xls</span>
-                <span className="text-slate-400 text-xs mt-1">Supports up to 10,000 rows</span>
+                <span className="text-slate-400 text-xs mt-1">All sheets are parsed automatically</span>
               </>
             )}
           </label>
 
-          {/* Inline notice / error */}
           {notice && (
             <div className={[
               'mt-3 text-xs rounded-xl px-3 py-2.5 leading-relaxed',
-              notice.kind === 'error'   ? 'bg-red-50 text-red-600 border border-red-100' :
+              notice.kind === 'error'   ? 'bg-red-50 text-red-600 border border-red-100'     :
               notice.kind === 'success' ? 'bg-green-50 text-green-700 border border-green-100' :
                                           'bg-blue-50 text-blue-600 border border-blue-100',
             ].join(' ')}>
@@ -407,71 +426,144 @@ export default function Home() {
           )}
         </section>
 
-        {/* ── 2. Column selection + preview ─────────────────────────────────── */}
+        {/* ── 2. Per-sheet column config ────────────────────────────────────── */}
         {hasFile && (
           <section className={card}>
-            <p className={sectionTitle}>2 · Phone Number Column</p>
-
-            <select
-              value={phoneCol}
-              onChange={e => {
-                setPhoneCol(e.target.value);
-                setCurrentIndex(0); // reset progress when column changes
-                setNotice(null);
-              }}
-              className={input}
-            >
-              {headers.map(h => (
-                <option key={h} value={h}>{h}</option>
-              ))}
-            </select>
-
-            {/* First-5-rows preview so the user can confirm the right column */}
-            {preview.length > 0 && (
-              <div className="mt-4 bg-slate-50 rounded-xl p-3 space-y-2">
-                <p className="text-xs font-semibold text-slate-400">Preview — first 5 rows:</p>
-                {preview.map(p => (
-                  <div key={p.rowNum} className="flex items-baseline gap-3 text-xs">
-                    <span className="text-slate-400 w-12 shrink-0">Row {p.rowNum}</span>
-                    <span className="font-mono text-slate-700 truncate">
-                      {p.raw || <span className="italic text-slate-300">(empty)</span>}
-                    </span>
-                  </div>
-                ))}
-              </div>
-            )}
-
-            <p className="mt-3 text-xs text-slate-400">
-              <span className="font-semibold text-slate-600">{total.toLocaleString()}</span> valid
-              number{total !== 1 ? 's' : ''} detected
-              {rows.length !== total && (
-                <> out of {rows.length.toLocaleString()} rows
-                  {' '}({(rows.length - total).toLocaleString()} skipped — empty or invalid)</>
+            <p className={sectionTitle}>
+              2 · Phone Number Column
+              {sheets.length > 1 && (
+                <span className="ml-2 normal-case font-normal text-slate-400">
+                  — configure each sheet independently
+                </span>
               )}
+            </p>
+
+            <div className="space-y-4">
+              {sheets.map((sheet, idx) => {
+                // Valid-number count for this sheet (derived locally for display)
+                const sheetValidCount = sheet.enabled && sheet.phoneCol
+                  ? sheet.rows.filter(
+                      row => normalizePhone(row[sheet.phoneCol], countryCode) !== null
+                    ).length
+                  : 0;
+
+                // Preview: first 3 raw values in the chosen column
+                const sheetPreview = sheet.rows.slice(0, 3).map((row, i) => ({
+                  rowNum: i + 1,
+                  raw: String(row[sheet.phoneCol] ?? ''),
+                }));
+
+                return (
+                  <div
+                    key={sheet.name}
+                    className={[
+                      'rounded-xl border p-3 transition-colors',
+                      sheet.enabled
+                        ? 'border-slate-200 bg-white'
+                        : 'border-slate-100 bg-slate-50 opacity-60',
+                    ].join(' ')}
+                  >
+                    {/* Sheet header row */}
+                    <div className="flex items-center justify-between mb-2.5">
+                      <div className="flex items-center gap-2 min-w-0">
+                        {/* Enable / disable toggle */}
+                        <button
+                          onClick={() => updateSheet(idx, { enabled: !sheet.enabled })}
+                          className={[
+                            'shrink-0 w-9 h-5 rounded-full transition-colors relative',
+                            sheet.enabled ? 'bg-green-500' : 'bg-slate-300',
+                          ].join(' ')}
+                          title={sheet.enabled ? 'Disable this sheet' : 'Enable this sheet'}
+                        >
+                          <span className={[
+                            'absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-all',
+                            sheet.enabled ? 'left-[18px]' : 'left-0.5',
+                          ].join(' ')} />
+                        </button>
+
+                        {/* Sheet name */}
+                        <span className="font-semibold text-sm text-slate-700 truncate">
+                          {sheet.name}
+                        </span>
+                      </div>
+
+                      {/* Row + valid-number summary */}
+                      <span className="shrink-0 text-xs text-slate-400 ml-2">
+                        {sheet.rows.length.toLocaleString()} rows
+                        {sheet.enabled && (
+                          <> · <span className="text-green-600 font-medium">{sheetValidCount.toLocaleString()} valid</span></>
+                        )}
+                      </span>
+                    </div>
+
+                    {/* Column selector — only shown when sheet is enabled */}
+                    {sheet.enabled && (
+                      <>
+                        {sheet.headers.length > 0 ? (
+                          <select
+                            value={sheet.phoneCol}
+                            onChange={e => updateSheet(idx, { phoneCol: e.target.value })}
+                            className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-green-400 transition"
+                          >
+                            {sheet.headers.map(h => (
+                              <option key={h} value={h}>{h}</option>
+                            ))}
+                          </select>
+                        ) : (
+                          <p className="text-xs text-slate-400 italic">Sheet has no columns</p>
+                        )}
+
+                        {/* Preview first 3 rows of selected column */}
+                        {sheetPreview.length > 0 && (
+                          <div className="mt-2.5 bg-slate-50 rounded-lg p-2.5 space-y-1.5">
+                            <p className="text-xs font-medium text-slate-400">Preview:</p>
+                            {sheetPreview.map(p => (
+                              <div key={p.rowNum} className="flex items-baseline gap-2 text-xs">
+                                <span className="text-slate-400 w-10 shrink-0">R{p.rowNum}</span>
+                                <span className="font-mono text-slate-700 truncate">
+                                  {p.raw || <span className="italic text-slate-300">(empty)</span>}
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* Total across all enabled sheets */}
+            <p className="mt-3 text-xs text-slate-400">
+              Combined total:{' '}
+              <span className="font-semibold text-slate-600">{total.toLocaleString()}</span> valid
+              number{total !== 1 ? 's' : ''} across{' '}
+              {sheets.filter(s => s.enabled).length} enabled sheet{sheets.filter(s => s.enabled).length !== 1 ? 's' : ''}
             </p>
           </section>
         )}
 
-        {/* ── 3. Country code + message ──────────────────────────────────────── */}
+        {/* ── 3. Settings ───────────────────────────────────────────────────── */}
         <section className={card}>
           <p className={sectionTitle}>3 · Settings</p>
 
           <div className="mb-4">
-            <label className={label}>
+            <label className={labelCls}>
               Default Country Code
-              <span className="ml-1 font-normal text-slate-400">(applied to numbers that have none)</span>
+              <span className="ml-1 font-normal text-slate-400">(applied to numbers without one)</span>
             </label>
             <input
               type="text"
               value={countryCode}
               onChange={e => setCountryCode(e.target.value)}
               placeholder="+91"
-              className={input}
+              className={inputCls}
             />
           </div>
 
           <div>
-            <label className={label}>
+            <label className={labelCls}>
               Message
               <span className="ml-1 font-normal text-slate-400">(same for every number)</span>
             </label>
@@ -480,17 +572,15 @@ export default function Home() {
               onChange={e => setMessage(e.target.value)}
               placeholder="Type your WhatsApp message here…"
               rows={4}
-              className={`${input} resize-none`}
+              className={`${inputCls} resize-none`}
             />
             {message.length > 0 && (
-              <p className="text-xs text-slate-400 mt-1 text-right">
-                {message.length} chars
-              </p>
+              <p className="text-xs text-slate-400 mt-1 text-right">{message.length} chars</p>
             )}
           </div>
         </section>
 
-        {/* ── 4. Progress + send controls ───────────────────────────────────── */}
+        {/* ── 4. Send controls ──────────────────────────────────────────────── */}
         {hasFile && total > 0 && (
           <section className={`${card} space-y-5`}>
             <p className={sectionTitle}>4 · Send Messages</p>
@@ -509,12 +599,12 @@ export default function Home() {
               </div>
             </div>
 
-            {/* Stats: Processed / Remaining / Total */}
+            {/* Stats grid */}
             <div className="grid grid-cols-3 gap-2 text-center">
               {([
-                { label: 'Processed', value: processed, bg: 'bg-blue-50',   text: 'text-blue-600'   },
-                { label: 'Remaining', value: remaining, bg: 'bg-amber-50',  text: 'text-amber-600'  },
-                { label: 'Total',     value: total,     bg: 'bg-slate-100', text: 'text-slate-700'  },
+                { label: 'Processed', value: processed, bg: 'bg-blue-50',   text: 'text-blue-600'  },
+                { label: 'Remaining', value: remaining, bg: 'bg-amber-50',  text: 'text-amber-600' },
+                { label: 'Total',     value: total,     bg: 'bg-slate-100', text: 'text-slate-700' },
               ] as const).map(s => (
                 <div key={s.label} className={`${s.bg} rounded-xl py-3.5 px-2`}>
                   <p className={`text-2xl font-bold tabular-nums ${s.text}`}>
@@ -528,18 +618,34 @@ export default function Home() {
             {/* Current number card */}
             {!allDone && current && (
               <div className="bg-green-50 border border-green-100 rounded-xl p-4 text-center">
-                <p className="text-xs text-slate-500 mb-1">
-                  Current · #{(currentIndex + 1).toLocaleString()} of {total.toLocaleString()}
-                </p>
+                {/* Position + sheet badge */}
+                <div className="flex items-center justify-center gap-2 mb-1">
+                  <span className="text-xs text-slate-500">
+                    #{(currentIndex + 1).toLocaleString()} of {total.toLocaleString()}
+                  </span>
+                  {sheets.length > 1 && (
+                    <span className="text-xs font-medium bg-green-100 text-green-700 rounded-full px-2 py-0.5">
+                      {current.sheetName}
+                    </span>
+                  )}
+                </div>
+
+                {/* Normalised number */}
                 <p className="text-2xl font-bold font-mono tracking-widest text-green-700 break-all">
                   +{current.normalized}
                 </p>
-                {/* Show the original cell value when it differs from the normalised form */}
+
+                {/* Show original only when it differs */}
                 {current.raw !== current.normalized && (
                   <p className="text-xs text-slate-400 mt-1.5">
                     Original: <span className="font-mono">{current.raw}</span>
                   </p>
                 )}
+
+                {/* Row in sheet */}
+                <p className="text-xs text-slate-400 mt-0.5">
+                  Sheet row {current.rowNum}
+                </p>
               </div>
             )}
 
@@ -553,10 +659,8 @@ export default function Home() {
               </div>
             )}
 
-            {/* ── Action buttons ─────────────────────────────────────────── */}
+            {/* Action buttons */}
             <div className="space-y-3">
-
-              {/* NEXT NUMBER — primary CTA, large touch target */}
               <button
                 onClick={handleNext}
                 disabled={!current || allDone}
@@ -571,7 +675,6 @@ export default function Home() {
                 NEXT NUMBER →
               </button>
 
-              {/* SAME NUMBER — secondary */}
               <button
                 onClick={handleSame}
                 disabled={!current}
@@ -587,9 +690,11 @@ export default function Home() {
               </button>
             </div>
 
-            {/* GO TO ROW */}
+            {/* Go to row */}
             <div>
-              <p className="text-xs text-slate-400 mb-2">Jump to a specific row in the valid-number list:</p>
+              <p className="text-xs text-slate-400 mb-2">
+                Jump to any position in the combined list:
+              </p>
               <div className="flex gap-2">
                 <input
                   type="number"
@@ -599,7 +704,7 @@ export default function Home() {
                   placeholder={`1 – ${total.toLocaleString()}`}
                   min={1}
                   max={total}
-                  className={`${input} flex-1 min-w-0`}
+                  className={`${inputCls} flex-1 min-w-0`}
                 />
                 <button
                   onClick={handleGoTo}
@@ -617,7 +722,7 @@ export default function Home() {
           <div className="bg-amber-50 border border-amber-100 rounded-2xl p-4 text-center">
             <p className="font-semibold text-amber-700 text-sm">No valid phone numbers found</p>
             <p className="text-xs text-slate-500 mt-1">
-              Try selecting a different column or check your country code.
+              Check that at least one sheet is enabled and the correct column is selected.
             </p>
           </div>
         )}
